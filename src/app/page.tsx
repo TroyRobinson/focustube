@@ -143,10 +143,15 @@ export default function App() {
       const json = await res.json();
       if (!res.ok) {
         // Clear results and selection if blocked by moderation
-        if (json?.code === "MODERATION_BLOCKED") {
+        if (json?.code === "MODERATION_BLOCKED" || json?.code === "MODERATION_UNAVAILABLE") {
           setResults([]);
           setSelected(null);
-          setError(json?.error || "Search blocked by content policy");
+          setError(
+            json?.error ||
+              (json?.code === "MODERATION_UNAVAILABLE"
+                ? "Search unavailable: moderation unavailable"
+                : "Search blocked by content policy"),
+          );
           return;
         }
         throw new Error(json?.error || "Search failed");

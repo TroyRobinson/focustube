@@ -1,10 +1,168 @@
 import { NextRequest, NextResponse } from "next/server";
 
-async function moderateQuery(text: string) {
+// Basic local denylist for obvious adult or highly suggestive terms
+// Intentionally aggressive per product requirement to avoid revealing skin-tight outfits, swimsuits, etc.
+const ADULT_BLOCK_TERMS = [
+  // Explicit sexual content and services
+  "porn",
+  "porno",
+  "pornhub",
+  "xvideos",
+  "xhamster",
+  "pornography",
+  "xxx",
+  "nsfw",
+  "hentai",
+  "incest",
+  "bestiality",
+  "rape",
+  "milf",
+  "gilf",
+  "teen",
+  "lolita",
+  "onlyfans",
+  "fansly",
+  "escort",
+  "escorts",
+  "prostitute",
+  "prostitution",
+  "hooker",
+  "call girl",
+  "camgirl",
+  "camgirls",
+  "camboy",
+  "webcam",
+  "camwhore",
+  // Anatomy/sexual actions
+  "sex",
+  "sexual",
+  "sexy",
+  "hot girl",
+  "hot girls",
+  "hot woman",
+  "hot women",
+  "nude",
+  "nudes",
+  "nudity",
+  "tits",
+  "boobs",
+  "breasts",
+  "nipple",
+  "nipples",
+  "areola",
+  "cleavage",
+  "cameltoe",
+  "ass",
+  "butt",
+  "butts",
+  "buttocks",
+  "booty",
+  "anal",
+  "deepthroat",
+  "blowjob",
+  "handjob",
+  "fisting",
+  "pegging",
+  "gangbang",
+  "cum",
+  "orgasm",
+  "edging",
+  "kink",
+  "kinky",
+  "bdsm",
+  "fetish",
+  "dominatrix",
+  "femdom",
+  // Clothing and erotic content styles
+  "lingerie",
+  "underwear",
+  "panties",
+  "bra",
+  "thong",
+  "bikini",
+  "swimsuit",
+  "swimwear",
+  "stockings",
+  "fishnets",
+  "yoga pants",
+  "leggings",
+  "sports bra",
+  // Dance/strip-related
+  "strip",
+  "stripper",
+  "strippers",
+  "striptease",
+  "lap dance",
+  "lapdance",
+  "pole dance",
+  "pole dancing",
+  "twerk",
+  "twerking",
+  "burlesque",
+  // Fitness/athletic contexts (aggressive filter)
+  "workout",
+  "gym",
+  "fitness",
+  "athletic",
+  "athletics",
+  "yoga",
+  "pilates",
+  "zumba",
+  "aerobics",
+  "cheer",
+  "cheerleader",
+  "cheerleading",
+  "gymnast",
+  "gymnastics",
+  // Casual/summer contexts with revealing outfits
+  "beach",
+  "swim",
+  "swimming",
+  "pool party",
+  "sunbathing",
+  // Performance/dance generic (aggressive filter)
+  "dance",
+  "dancer",
+  "dancers",
+  "dancing",
+  // Suggestive descriptors
+  "sensual",
+  "seduce",
+  "seductive",
+  "seduction",
+  "provocative",
+  "thirst trap",
+  "thirsttrap",
+  "babe",
+  "babes",
+  "model",
+  "supermodel",
+];
+const ADULT_BLOCK_RE = new RegExp(`\\b(${ADULT_BLOCK_TERMS.map(t => t.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")).join("|")})\\b`, "i");
+
+// Cache moderation decisions per query (normalized), to avoid repeated API calls
+const MOD_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12h
+type CacheEntry = { decision: "allow" | "block"; categories?: string[]; ts: number };
+const moderationCache = new Map<string, CacheEntry>();
+
+function normalizeQuery(s: string) {
+  return s.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+type ModerationResult =
+  | { allowed: true }
+  | {
+      allowed: false;
+      reason: "flagged" | "unavailable";
+      categories?: string[];
+      debug?: { cause: "no_key" | "upstream" | "exception"; status?: number };
+    };
+
+async function moderateQuery(text: string): Promise<ModerationResult> {
   const apiKey = process.env.OPENAI_API_KEY;
-  // If no key, skip moderation (fail-open)
+  // Fail-closed: if moderation key is missing, do not allow the query
   if (!apiKey) {
-    return { allowed: true, skipped: true } as const;
+    return { allowed: false, reason: "unavailable", debug: { cause: "no_key" } } as const;
   }
 
   try {
@@ -20,8 +178,43 @@ async function moderateQuery(text: string) {
       }),
     });
     if (!res.ok) {
-      // Do not block on upstream failures
-      return { allowed: true, error: `Moderation upstream ${res.status}` } as const;
+      // If rate limited, don't hammer with a second call
+      if (res.status === 429) {
+        return { allowed: false, reason: "unavailable", debug: { cause: "upstream", status: res.status } } as const;
+      }
+      // Try legacy text model as a graceful fallback for accounts without omni access
+      try {
+        const legacy = await fetch("https://api.openai.com/v1/moderations", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "text-moderation-latest",
+            input: text.slice(0, 4000),
+          }),
+        });
+        if (!legacy.ok) {
+          return {
+            allowed: false,
+            reason: "unavailable",
+            debug: { cause: "upstream", status: legacy.status },
+          } as const;
+        }
+        const legacyData = await legacy.json();
+        const legacyResult = legacyData?.results?.[0];
+        const flagged = !!legacyResult?.flagged;
+        const categories = legacyResult?.categories || {};
+        const flaggedCategories = Object.entries(categories)
+          .filter(([, v]) => !!v)
+          .map(([k]) => k);
+        return flagged
+          ? ({ allowed: false, reason: "flagged", categories: flaggedCategories } as const)
+          : ({ allowed: true } as const);
+      } catch {
+        return { allowed: false, reason: "unavailable", debug: { cause: "upstream", status: res.status } } as const;
+      }
     }
     const data = await res.json();
     const result = data?.results?.[0];
@@ -30,14 +223,12 @@ async function moderateQuery(text: string) {
     const flaggedCategories = Object.entries(categories)
       .filter(([, v]) => !!v)
       .map(([k]) => k);
-    return {
-      allowed: !flagged,
-      flagged,
-      categories: flaggedCategories,
-    } as const;
+    return flagged
+      ? ({ allowed: false, reason: "flagged", categories: flaggedCategories } as const)
+      : ({ allowed: true } as const);
   } catch {
-    // Network/other error – do not block
-    return { allowed: true, error: "Moderation request failed" } as const;
+    // Fail-closed on network/other errors
+    return { allowed: false, reason: "unavailable", debug: { cause: "exception" } } as const;
   }
 }
 
@@ -50,18 +241,67 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing required query 'q'" }, { status: 400 });
   }
 
-  // Content moderation pre-check on the user's search query
-  const moderation = await moderateQuery(q);
-  if (!moderation.allowed) {
+  const normQ = normalizeQuery(q);
+  // 1) Local denylist short-circuit
+  if (ADULT_BLOCK_RE.test(normQ)) {
+    // cache as blocked to avoid repeated checks
+    moderationCache.set(normQ, { decision: "block", categories: ["sexual"], ts: Date.now() });
     return NextResponse.json(
       {
         error: "Query blocked by content moderation",
         code: "MODERATION_BLOCKED",
-        categories: moderation.categories ?? [],
+        categories: ["sexual"],
       },
       { status: 422 },
     );
   }
+
+  // 2) Cache check to avoid repeated moderation calls (e.g., pagination)
+  const cached = moderationCache.get(normQ);
+  if (cached && Date.now() - cached.ts < MOD_CACHE_TTL_MS) {
+    if (cached.decision === "block") {
+      return NextResponse.json(
+        {
+          error: "Query blocked by content moderation",
+          code: "MODERATION_BLOCKED",
+          categories: cached.categories ?? [],
+        },
+        { status: 422 },
+      );
+    }
+    // allowed -> continue to YouTube without another moderation call
+  }
+
+  // Content moderation pre-check on the user's search query
+  const moderation = await moderateQuery(q);
+  if (!moderation.allowed) {
+    if (moderation.reason === "flagged") {
+      // cache the decision
+      moderationCache.set(normQ, { decision: "block", categories: moderation.categories ?? [], ts: Date.now() });
+      return NextResponse.json(
+        {
+          error: "Query blocked by content moderation",
+          code: "MODERATION_BLOCKED",
+          categories: moderation.categories ?? [],
+        },
+        { status: 422 },
+      );
+    }
+    // Moderation unavailable -> fail-closed
+    return NextResponse.json(
+      {
+        error: "Search temporarily unavailable (moderation unavailable)",
+        code: "MODERATION_UNAVAILABLE",
+        // In dev, include a hint to speed up debugging
+        ...(process.env.NODE_ENV !== "production"
+          ? { details: moderation.debug }
+          : {}),
+      },
+      { status: 503 },
+    );
+  }
+  // cache allow decision
+  moderationCache.set(normQ, { decision: "allow", ts: Date.now() });
 
   const key = process.env.YOUTUBE_API_KEY;
   if (!key) {
