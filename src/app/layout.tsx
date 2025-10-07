@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Create Instant App',
-  description: 'Instant DB Starter App',
+  title: 'FocusTube',
+  description: 'Search YouTube and play videos',
 };
 
 export default function RootLayout({
