@@ -68,6 +68,50 @@ function useDailyPlayLimit(max: number) {
   return { count, remaining, canPlay, increment, resetForToday, ready } as const;
 }
 
+// Parse YouTube video URLs (full, shortened, embed, shorts, live)
+function extractYouTubeVideoId(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  // Try to coerce into a URL; add https:// if missing
+  let url: URL | null = null;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    try {
+      url = new URL(`https://${trimmed}`);
+    } catch {
+      url = null;
+    }
+  }
+  if (!url) return null;
+
+  const host = url.hostname.replace(/^www\./, "");
+
+  // youtu.be/<id>
+  if (host === "youtu.be") {
+    const candidate = url.pathname.replace(/^\//, "").split("/")[0] || "";
+    return /^[a-zA-Z0-9_-]{11}$/.test(candidate) ? candidate : null;
+  }
+
+  // *.youtube.com paths
+  if (host.endsWith("youtube.com")) {
+    // watch?v=<id>
+    const v = url.searchParams.get("v");
+    if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+
+    const parts = url.pathname.split("/").filter(Boolean);
+    // /embed/<id>, /shorts/<id>, /live/<id>
+    if (parts.length >= 2) {
+      const [seg, id] = [parts[0], parts[1]];
+      if (["embed", "shorts", "live"].includes(seg) && /^[a-zA-Z0-9_-]{11}$/.test(id)) {
+        return id;
+      }
+    }
+  }
+
+  return null;
+}
+
 type YTItem = {
   id: string;
   title: string;
@@ -98,6 +142,13 @@ export default function App() {
       const res = await fetch(`/api/youtube?${sp.toString()}`);
       const json = await res.json();
       if (!res.ok) {
+        // Clear results and selection if blocked by moderation
+        if (json?.code === "MODERATION_BLOCKED") {
+          setResults([]);
+          setSelected(null);
+          setError(json?.error || "Search blocked by content policy");
+          return;
+        }
         throw new Error(json?.error || "Search failed");
       }
       setResults(json.items as YTItem[]);
@@ -125,6 +176,22 @@ export default function App() {
 
   function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    // If the query is a YouTube URL, play it (respecting daily limit)
+    const urlId = extractYouTubeVideoId(query);
+    if (urlId) {
+      setError(null);
+      if (!limit.canPlay && selected !== urlId) {
+        setError("Daily play limit reached (5). Try again tomorrow.");
+        return;
+      }
+      if (selected !== urlId) {
+        limit.increment();
+      }
+      setSelected(urlId);
+      return;
+    }
+
+    // Fallback to normal search
     runSearch(query);
   }
 
@@ -149,7 +216,7 @@ export default function App() {
             <input
               className="w-full rounded-md border border-gray-300 px-3 py-2 outline-none focus:border-gray-500"
               type="text"
-              placeholder="Search YouTube (e.g. lo-fi beats)"
+              placeholder="Search YouTube or paste a video URL"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -184,9 +251,11 @@ export default function App() {
 
         <section>
           {results.length === 0 ? (
-            <div className="rounded-md border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500">
-              Search for a video to get started.
-            </div>
+            selected ? null : (
+              <div className="rounded-md border border-dashed border-gray-300 p-8 text-center text-sm text-gray-500">
+                Search for a video to get started.
+              </div>
+            )
           ) : (
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {results.map((v) => (
