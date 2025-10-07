@@ -149,11 +149,15 @@ function normalizeQuery(s: string) {
   return s.toLowerCase().trim().replace(/\s+/g, " ");
 }
 
+// Circuit breaker for OpenAI rate limits
+const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+let RATE_LIMIT_UNTIL = 0;
+
 type ModerationResult =
   | { allowed: true }
   | {
       allowed: false;
-      reason: "flagged" | "unavailable";
+      reason: "flagged" | "unavailable" | "rate_limited";
       categories?: string[];
       debug?: { cause: "no_key" | "upstream" | "exception"; status?: number };
     };
@@ -178,9 +182,9 @@ async function moderateQuery(text: string): Promise<ModerationResult> {
       }),
     });
     if (!res.ok) {
-      // If rate limited, don't hammer with a second call
+      // If rate limited, trip the breaker (handled by caller)
       if (res.status === 429) {
-        return { allowed: false, reason: "unavailable", debug: { cause: "upstream", status: res.status } } as const;
+        return { allowed: false, reason: "rate_limited", debug: { cause: "upstream", status: res.status } } as const;
       }
       // Try legacy text model as a graceful fallback for accounts without omni access
       try {
@@ -272,36 +276,50 @@ export async function GET(req: NextRequest) {
     // allowed -> continue to YouTube without another moderation call
   }
 
-  // Content moderation pre-check on the user's search query
-  const moderation = await moderateQuery(q);
-  if (!moderation.allowed) {
-    if (moderation.reason === "flagged") {
-      // cache the decision
-      moderationCache.set(normQ, { decision: "block", categories: moderation.categories ?? [], ts: Date.now() });
-      return NextResponse.json(
-        {
-          error: "Query blocked by content moderation",
-          code: "MODERATION_BLOCKED",
-          categories: moderation.categories ?? [],
-        },
-        { status: 422 },
-      );
+  // 3) If we recently hit rate limits, skip moderation calls and rely on denylist
+  if (Date.now() < RATE_LIMIT_UNTIL) {
+    // Do not call OpenAI during cooldown; proceed only if it passes denylist
+    // Optionally, we could add lightweight heuristics here.
+    // Continue to YouTube.
+  } else {
+    // Content moderation pre-check on the user's search query
+    const moderation = await moderateQuery(q);
+    if (!moderation.allowed) {
+      if (moderation.reason === "flagged") {
+        // cache the decision
+        moderationCache.set(normQ, { decision: "block", categories: moderation.categories ?? [], ts: Date.now() });
+        return NextResponse.json(
+          {
+            error: "Query blocked by content moderation",
+            code: "MODERATION_BLOCKED",
+            categories: moderation.categories ?? [],
+          },
+          { status: 422 },
+        );
+      }
+      if (moderation.reason === "rate_limited") {
+        // Trip breaker and degrade gracefully: rely on denylist and YouTube safeSearch
+        RATE_LIMIT_UNTIL = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+        // fall through to proceed without moderation
+      } else {
+        // Moderation unavailable -> fail-closed
+        return NextResponse.json(
+          {
+            error: "Search temporarily unavailable (moderation unavailable)",
+            code: "MODERATION_UNAVAILABLE",
+            // In dev, include a hint to speed up debugging
+            ...(process.env.NODE_ENV !== "production"
+              ? { details: moderation.debug }
+              : {}),
+          },
+          { status: 503 },
+        );
+      }
+    } else {
+      // cache allow decision
+      moderationCache.set(normQ, { decision: "allow", ts: Date.now() });
     }
-    // Moderation unavailable -> fail-closed
-    return NextResponse.json(
-      {
-        error: "Search temporarily unavailable (moderation unavailable)",
-        code: "MODERATION_UNAVAILABLE",
-        // In dev, include a hint to speed up debugging
-        ...(process.env.NODE_ENV !== "production"
-          ? { details: moderation.debug }
-          : {}),
-      },
-      { status: 503 },
-    );
   }
-  // cache allow decision
-  moderationCache.set(normQ, { decision: "allow", ts: Date.now() });
 
   const key = process.env.YOUTUBE_API_KEY;
   if (!key) {
