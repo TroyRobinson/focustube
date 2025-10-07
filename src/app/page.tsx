@@ -2,6 +2,72 @@
 
 import React from "react";
 
+// Daily play limit (localStorage-backed)
+const MAX_DAILY_PLAYS = 5;
+const STORAGE_KEY = "ft.dailyPlayCounter";
+
+type PlayCounter = {
+  date: string;
+  count: number;
+};
+
+function todayKey() {
+  // Local-day key so it resets per local calendar day
+  return new Date().toDateString();
+}
+
+function readCounter(): PlayCounter {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const today = todayKey();
+    if (!raw) return { date: today, count: 0 };
+    const parsed = JSON.parse(raw) as PlayCounter;
+    if (!parsed?.date || parsed.date !== today) {
+      return { date: today, count: 0 };
+    }
+    return { date: parsed.date, count: Number(parsed.count) || 0 };
+  } catch {
+    return { date: todayKey(), count: 0 };
+  }
+}
+
+function writeCounter(counter: PlayCounter) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(counter));
+  } catch {
+    // no-op
+  }
+}
+
+function useDailyPlayLimit(max: number) {
+  const [count, setCount] = React.useState(0);
+  const [ready, setReady] = React.useState(false);
+
+  React.useEffect(() => {
+    const c = readCounter();
+    setCount(c.count);
+    setReady(true);
+  }, []);
+
+  const increment = React.useCallback(() => {
+    setCount((prev) => {
+      const next = Math.min(max, prev + 1);
+      writeCounter({ date: todayKey(), count: next });
+      return next;
+    });
+  }, [max]);
+
+  const resetForToday = React.useCallback(() => {
+    writeCounter({ date: todayKey(), count: 0 });
+    setCount(0);
+  }, []);
+
+  const remaining = Math.max(0, max - count);
+  const canPlay = ready && remaining > 0;
+
+  return { count, remaining, canPlay, increment, resetForToday, ready } as const;
+}
+
 type YTItem = {
   id: string;
   title: string;
@@ -11,6 +77,7 @@ type YTItem = {
 };
 
 export default function App() {
+  const limit = useDailyPlayLimit(MAX_DAILY_PLAYS);
   const [query, setQuery] = React.useState("");
   const [results, setResults] = React.useState<YTItem[]>([]);
   const [selected, setSelected] = React.useState<string | null>(null);
@@ -39,7 +106,12 @@ export default function App() {
         prev: json.prevPageToken ?? null,
       });
       if ((json.items as YTItem[]).length > 0) {
-        setSelected((json.items as YTItem[])[0].id);
+        // Only auto-select a video if the user still has plays left today
+        if (limit.ready && limit.canPlay) {
+          setSelected((json.items as YTItem[])[0].id);
+        } else {
+          setSelected(null);
+        }
       } else {
         setSelected(null);
       }
@@ -61,7 +133,19 @@ export default function App() {
       <div className="mx-auto max-w-5xl">
         <header className="mb-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-between">
           <h1 className="text-2xl font-semibold tracking-tight">FocusTube</h1>
-          <form onSubmit={onSubmit} className="flex w-full max-w-xl gap-2">
+          <form onSubmit={onSubmit} className="flex w-full max-w-xl items-center gap-2">
+            {/* Daily plays counter badge */}
+            <div
+              className={`select-none rounded-md border px-2 py-1 text-xs font-medium ${
+                limit.remaining === 0
+                  ? "border-red-300 bg-red-50 text-red-700"
+                  : "border-gray-300 bg-gray-50 text-gray-700"
+              }`}
+              title={`Plays used today: ${limit.count}/${MAX_DAILY_PLAYS}`}
+              aria-label={`Plays used today: ${limit.count} of ${MAX_DAILY_PLAYS}`}
+            >
+              {limit.count}/{MAX_DAILY_PLAYS}
+            </div>
             <input
               className="w-full rounded-md border border-gray-300 px-3 py-2 outline-none focus:border-gray-500"
               type="text"
@@ -108,10 +192,21 @@ export default function App() {
               {results.map((v) => (
                 <button
                   key={v.id}
-                  onClick={() => setSelected(v.id)}
+                  onClick={() => {
+                    if (!limit.canPlay) {
+                      setError("Daily play limit reached (5). Try again tomorrow.");
+                      return;
+                    }
+                    // Only count a play when switching to a new video
+                    if (selected !== v.id) {
+                      limit.increment();
+                    }
+                    setSelected(v.id);
+                  }}
+                  disabled={!limit.canPlay && selected !== v.id}
                   className={`group overflow-hidden rounded-md border text-left hover:shadow-md ${
                     selected === v.id ? "border-gray-800" : "border-gray-200"
-                  }`}
+                  } ${!limit.canPlay && selected !== v.id ? "opacity-60" : ""}`}
                 >
                   <div className="aspect-video w-full overflow-hidden bg-gray-100">
                     {/* Use img to avoid Next image config */}
