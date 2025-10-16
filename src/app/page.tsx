@@ -38,7 +38,7 @@ namespace YT {
 }
 
 // Daily watch time limit (localStorage-backed)
-const MAX_DAILY_SECONDS = 120; // 2 minutes (for testing)
+const MAX_DAILY_SECONDS = 2700; // 45 minutes
 const STORAGE_KEY = "ft.dailyWatchTime";
 
 type WatchTimeCounter = {
@@ -221,6 +221,7 @@ export default function App() {
     prev: string | null;
   }>({ next: null, prev: null });
   const [ytReady, setYtReady] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
   const playerRef = React.useRef<YT.Player | null>(null);
   const playerContainerRef = React.useRef<HTMLDivElement>(null);
 
@@ -269,7 +270,7 @@ export default function App() {
                 playerRef.current = null;
               }
               setSelected(null);
-              setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+              setError("Daily watch time limit reached (45 minutes). Try again tomorrow.");
               return;
             }
             // Start tracking time when video plays
@@ -309,7 +310,7 @@ export default function App() {
       setSelected(null);
 
       // Show error message
-      setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+      setError("Daily watch time limit reached (45 minutes). Try again tomorrow.");
     }
     // Only need the specific boolean values, not the entire watchTime object
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -369,7 +370,7 @@ export default function App() {
     if (urlId) {
       setError(null);
       if (!watchTime.canPlay) {
-        setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+        setError("Daily watch time limit reached (45 minutes). Try again tomorrow.");
         return;
       }
       setSelected(urlId);
@@ -378,6 +379,20 @@ export default function App() {
 
     // Fallback to normal search
     runSearch(query);
+  }
+
+  async function copyVideoUrl() {
+    if (!selected) return;
+
+    const url = `https://www.youtube.com/watch?v=${selected}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      // Reset after 2 seconds
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
   }
 
   return (
@@ -424,11 +439,35 @@ export default function App() {
         )}
 
         {selected && (
-          <div
-            ref={playerContainerRef}
-            className="mb-6 aspect-video w-full overflow-hidden rounded-md border border-gray-300"
-          >
-            <div id="yt-player" className="h-full w-full" />
+          <div className="mb-6">
+            <div
+              ref={playerContainerRef}
+              className="aspect-video w-full overflow-hidden rounded-md border border-gray-300"
+            >
+              <div id="yt-player" className="h-full w-full" />
+            </div>
+            <div className="mt-2 flex justify-end">
+              <button
+                onClick={copyVideoUrl}
+                className="flex items-center gap-2 rounded-md border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                title="Copy video URL"
+              >
+                <svg
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                  />
+                </svg>
+                {copied ? "Copied!" : "Copy URL"}
+              </button>
+            </div>
           </div>
         )}
 
@@ -446,7 +485,7 @@ export default function App() {
                   key={v.id}
                   onClick={() => {
                     if (!watchTime.canPlay) {
-                      setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+                      setError("Daily watch time limit reached (45 minutes). Try again tomorrow.");
                       return;
                     }
                     setSelected(v.id);
