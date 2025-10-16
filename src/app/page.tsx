@@ -2,13 +2,48 @@
 
 import React from "react";
 
-// Daily play limit (localStorage-backed)
-const MAX_DAILY_PLAYS = 5;
-const STORAGE_KEY = "ft.dailyPlayCounter";
+// YouTube IFrame API type declarations
+declare global {
+  interface Window {
+    YT: {
+      Player: new (
+        elementId: string,
+        config: {
+          videoId: string;
+          events?: {
+            onReady?: (event: { target: YT.Player }) => void;
+            onStateChange?: (event: { target: YT.Player; data: number }) => void;
+          };
+        }
+      ) => YT.Player;
+      PlayerState: {
+        UNSTARTED: -1;
+        ENDED: 0;
+        PLAYING: 1;
+        PAUSED: 2;
+        BUFFERING: 3;
+        CUED: 5;
+      };
+    };
+    onYouTubeIframeAPIReady: () => void;
+  }
+}
 
-type PlayCounter = {
+namespace YT {
+  export interface Player {
+    destroy(): void;
+    loadVideoById(videoId: string): void;
+    pauseVideo(): void;
+  }
+}
+
+// Daily watch time limit (localStorage-backed)
+const MAX_DAILY_SECONDS = 120; // 2 minutes (for testing)
+const STORAGE_KEY = "ft.dailyWatchTime";
+
+type WatchTimeCounter = {
   date: string;
-  count: number;
+  totalSeconds: number;
 };
 
 function todayKey() {
@@ -16,22 +51,22 @@ function todayKey() {
   return new Date().toDateString();
 }
 
-function readCounter(): PlayCounter {
+function readWatchTime(): WatchTimeCounter {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     const today = todayKey();
-    if (!raw) return { date: today, count: 0 };
-    const parsed = JSON.parse(raw) as PlayCounter;
+    if (!raw) return { date: today, totalSeconds: 0 };
+    const parsed = JSON.parse(raw) as WatchTimeCounter;
     if (!parsed?.date || parsed.date !== today) {
-      return { date: today, count: 0 };
+      return { date: today, totalSeconds: 0 };
     }
-    return { date: parsed.date, count: Number(parsed.count) || 0 };
+    return { date: parsed.date, totalSeconds: Number(parsed.totalSeconds) || 0 };
   } catch {
-    return { date: todayKey(), count: 0 };
+    return { date: todayKey(), totalSeconds: 0 };
   }
 }
 
-function writeCounter(counter: PlayCounter) {
+function writeWatchTime(counter: WatchTimeCounter) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(counter));
   } catch {
@@ -39,33 +74,78 @@ function writeCounter(counter: PlayCounter) {
   }
 }
 
-function useDailyPlayLimit(max: number) {
-  const [count, setCount] = React.useState(0);
+function useDailyWatchTime(maxSeconds: number) {
+  const [totalSeconds, setTotalSeconds] = React.useState(0);
   const [ready, setReady] = React.useState(false);
+  const [isTracking, setIsTracking] = React.useState(false);
+  const intervalRef = React.useRef<NodeJS.Timeout | null>(null);
+  const trackingStartTime = React.useRef<number>(0);
+  const baseSeconds = React.useRef<number>(0);
 
+  // Load initial time on mount
   React.useEffect(() => {
-    const c = readCounter();
-    setCount(c.count);
+    const data = readWatchTime();
+    setTotalSeconds(data.totalSeconds);
     setReady(true);
   }, []);
 
-  const increment = React.useCallback(() => {
-    setCount((prev) => {
-      const next = Math.min(max, prev + 1);
-      writeCounter({ date: todayKey(), count: next });
-      return next;
-    });
-  }, [max]);
+  // Start tracking time - use wall-clock time to handle background tabs
+  const startTracking = React.useCallback(() => {
+    if (isTracking) return;
+    trackingStartTime.current = Date.now();
+    baseSeconds.current = totalSeconds;
+    setIsTracking(true);
+  }, [isTracking, totalSeconds]);
 
-  const resetForToday = React.useCallback(() => {
-    writeCounter({ date: todayKey(), count: 0 });
-    setCount(0);
-  }, []);
+  // Stop tracking time - calculate final elapsed time
+  const stopTracking = React.useCallback(() => {
+    if (!isTracking) return;
 
-  const remaining = Math.max(0, max - count);
-  const canPlay = ready && remaining > 0;
+    // Calculate actual elapsed time based on wall-clock
+    const elapsed = Math.floor((Date.now() - trackingStartTime.current) / 1000);
+    const finalSeconds = Math.min(maxSeconds, baseSeconds.current + elapsed);
 
-  return { count, remaining, canPlay, increment, resetForToday, ready } as const;
+    setTotalSeconds(finalSeconds);
+    writeWatchTime({ date: todayKey(), totalSeconds: finalSeconds });
+    setIsTracking(false);
+
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, [isTracking, maxSeconds]);
+
+  // Wall-clock based time tracking (works even when tab is in background)
+  React.useEffect(() => {
+    if (isTracking) {
+      // Update display every second
+      intervalRef.current = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - trackingStartTime.current) / 1000);
+        const newTotal = Math.min(maxSeconds, baseSeconds.current + elapsed);
+        setTotalSeconds(newTotal);
+
+        // Persist every 5 seconds to reduce I/O
+        if (newTotal % 5 === 0 || newTotal >= maxSeconds) {
+          writeWatchTime({ date: todayKey(), totalSeconds: newTotal });
+        }
+      }, 1000);
+    } else if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [isTracking, maxSeconds]);
+
+  const remainingSeconds = Math.max(0, maxSeconds - totalSeconds);
+  const canPlay = ready && remainingSeconds > 0;
+
+  return { totalSeconds, remainingSeconds, canPlay, startTracking, stopTracking, ready, isTracking } as const;
 }
 
 // Parse YouTube video URLs (full, shortened, embed, shorts, live)
@@ -120,8 +200,17 @@ type YTItem = {
   thumbnail: string;
 };
 
+// Format seconds to minutes display (e.g., "45m" or "1h 15m")
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  return remainingMins > 0 ? `${hours}h ${remainingMins}m` : `${hours}h`;
+}
+
 export default function App() {
-  const limit = useDailyPlayLimit(MAX_DAILY_PLAYS);
+  const watchTime = useDailyWatchTime(MAX_DAILY_SECONDS);
   const [query, setQuery] = React.useState("");
   const [results, setResults] = React.useState<YTItem[]>([]);
   const [selected, setSelected] = React.useState<string | null>(null);
@@ -131,6 +220,100 @@ export default function App() {
     next: string | null;
     prev: string | null;
   }>({ next: null, prev: null });
+  const [ytReady, setYtReady] = React.useState(false);
+  const playerRef = React.useRef<YT.Player | null>(null);
+  const playerContainerRef = React.useRef<HTMLDivElement>(null);
+
+  // Load YouTube IFrame API
+  React.useEffect(() => {
+    // Check if API already loaded
+    if (window.YT && window.YT.Player) {
+      setYtReady(true);
+      return;
+    }
+
+    // Set up callback
+    window.onYouTubeIframeAPIReady = () => {
+      setYtReady(true);
+    };
+
+    // Load the script
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    const firstScriptTag = document.getElementsByTagName("script")[0];
+    firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+  }, []);
+
+  // Initialize/update YouTube Player when video changes
+  React.useEffect(() => {
+    if (!ytReady || !selected || !playerContainerRef.current) return;
+
+    // Destroy existing player
+    if (playerRef.current) {
+      playerRef.current.destroy();
+      playerRef.current = null;
+    }
+
+    // Create new player
+    playerRef.current = new window.YT.Player("yt-player", {
+      videoId: selected,
+      events: {
+        onStateChange: (event) => {
+          const state = event.data;
+          if (state === window.YT.PlayerState.PLAYING) {
+            // Check if limit already reached before starting
+            if (!watchTime.canPlay) {
+              // Immediately stop and unload video
+              if (playerRef.current) {
+                playerRef.current.destroy();
+                playerRef.current = null;
+              }
+              setSelected(null);
+              setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+              return;
+            }
+            // Start tracking time when video plays
+            watchTime.startTracking();
+          } else if (
+            state === window.YT.PlayerState.PAUSED ||
+            state === window.YT.PlayerState.ENDED
+          ) {
+            // Stop tracking time when video pauses or ends
+            watchTime.stopTracking();
+          }
+        },
+      },
+    });
+
+    return () => {
+      if (playerRef.current) {
+        playerRef.current.destroy();
+        playerRef.current = null;
+      }
+    };
+    // Only recreate player when video ID or API readiness changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ytReady, selected]);
+
+  // Auto-stop and unload video when time limit is reached during playback
+  React.useEffect(() => {
+    if (!watchTime.canPlay && watchTime.isTracking) {
+      // Stop tracking immediately
+      watchTime.stopTracking();
+
+      // Destroy player and unload video
+      if (playerRef.current) {
+        playerRef.current.destroy();
+        playerRef.current = null;
+      }
+      setSelected(null);
+
+      // Show error message
+      setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
+    }
+    // Only need the specific boolean values, not the entire watchTime object
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchTime.canPlay, watchTime.isTracking]);
 
   async function runSearch(q: string, token?: string) {
     if (!q.trim()) return;
@@ -162,8 +345,8 @@ export default function App() {
         prev: json.prevPageToken ?? null,
       });
       if ((json.items as YTItem[]).length > 0) {
-        // Only auto-select a video if the user still has plays left today
-        if (limit.ready && limit.canPlay) {
+        // Only auto-select a video if the user still has watch time left today
+        if (watchTime.ready && watchTime.canPlay) {
           setSelected((json.items as YTItem[])[0].id);
         } else {
           setSelected(null);
@@ -185,12 +368,9 @@ export default function App() {
     const urlId = extractYouTubeVideoId(query);
     if (urlId) {
       setError(null);
-      if (!limit.canPlay && selected !== urlId) {
-        setError("Daily play limit reached (5). Try again tomorrow.");
+      if (!watchTime.canPlay) {
+        setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
         return;
-      }
-      if (selected !== urlId) {
-        limit.increment();
       }
       setSelected(urlId);
       return;
@@ -206,17 +386,19 @@ export default function App() {
         <header className="mb-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-between">
           <h1 className="text-2xl font-semibold tracking-tight">FocusTube</h1>
           <form onSubmit={onSubmit} className="flex w-full max-w-xl items-center gap-2">
-            {/* Daily plays counter badge */}
+            {/* Daily watch time badge */}
             <div
               className={`select-none rounded-md border px-2 py-1 text-xs font-medium ${
-                limit.remaining === 0
+                watchTime.remainingSeconds === 0
                   ? "border-red-300 bg-red-50 text-red-700"
-                  : "border-gray-300 bg-gray-50 text-gray-700"
+                  : watchTime.remainingSeconds < 300
+                    ? "border-orange-300 bg-orange-50 text-orange-700"
+                    : "border-gray-300 bg-gray-50 text-gray-700"
               }`}
-              title={`Plays used today: ${limit.count}/${MAX_DAILY_PLAYS}`}
-              aria-label={`Plays used today: ${limit.count} of ${MAX_DAILY_PLAYS}`}
+              title={`Watch time used today: ${formatTime(watchTime.totalSeconds)} / ${formatTime(MAX_DAILY_SECONDS)}`}
+              aria-label={`Watch time used today: ${formatTime(watchTime.totalSeconds)} of ${formatTime(MAX_DAILY_SECONDS)}`}
             >
-              {limit.count}/{MAX_DAILY_PLAYS}
+              {formatTime(watchTime.totalSeconds)}/{formatTime(MAX_DAILY_SECONDS)}
             </div>
             <input
               className="w-full rounded-md border border-gray-300 px-3 py-2 outline-none focus:border-gray-500"
@@ -242,15 +424,11 @@ export default function App() {
         )}
 
         {selected && (
-          <div className="mb-6 aspect-video w-full overflow-hidden rounded-md border border-gray-300">
-            <iframe
-              className="h-full w-full"
-              src={`https://www.youtube.com/embed/${selected}`}
-              title="YouTube video player"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-              referrerPolicy="strict-origin-when-cross-origin"
-              allowFullScreen
-            />
+          <div
+            ref={playerContainerRef}
+            className="mb-6 aspect-video w-full overflow-hidden rounded-md border border-gray-300"
+          >
+            <div id="yt-player" className="h-full w-full" />
           </div>
         )}
 
@@ -267,20 +445,16 @@ export default function App() {
                 <button
                   key={v.id}
                   onClick={() => {
-                    if (!limit.canPlay) {
-                      setError("Daily play limit reached (5). Try again tomorrow.");
+                    if (!watchTime.canPlay) {
+                      setError("Daily watch time limit reached (2 minutes). Try again tomorrow.");
                       return;
-                    }
-                    // Only count a play when switching to a new video
-                    if (selected !== v.id) {
-                      limit.increment();
                     }
                     setSelected(v.id);
                   }}
-                  disabled={!limit.canPlay && selected !== v.id}
+                  disabled={!watchTime.canPlay && selected !== v.id}
                   className={`group overflow-hidden rounded-md border text-left hover:shadow-md ${
                     selected === v.id ? "border-gray-800" : "border-gray-200"
-                  } ${!limit.canPlay && selected !== v.id ? "opacity-60" : ""}`}
+                  } ${!watchTime.canPlay && selected !== v.id ? "opacity-60" : ""}`}
                 >
                   <div className="aspect-video w-full overflow-hidden bg-gray-100">
                     {/* Use img to avoid Next image config */}

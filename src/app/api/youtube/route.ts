@@ -137,6 +137,8 @@ const ADULT_BLOCK_TERMS = [
   "babes",
   "model",
   "supermodel",
+  // Test Word
+  "periwinkle",
 ];
 const ADULT_BLOCK_RE = new RegExp(`\\b(${ADULT_BLOCK_TERMS.map(t => t.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")).join("|")})\\b`, "i");
 
