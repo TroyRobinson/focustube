@@ -10,6 +10,10 @@ declare global {
         elementId: string,
         config: {
           videoId: string;
+          playerVars?: {
+            rel?: number;
+            modestbranding?: number;
+          };
           events?: {
             onReady?: (event: { target: YT.Player }) => void;
             onStateChange?: (event: { target: YT.Player; data: number }) => void;
@@ -34,6 +38,8 @@ namespace YT {
     destroy(): void;
     loadVideoById(videoId: string): void;
     pauseVideo(): void;
+    getCurrentTime(): number;
+    getDuration(): number;
   }
 }
 
@@ -222,8 +228,10 @@ export default function App() {
   }>({ next: null, prev: null });
   const [ytReady, setYtReady] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
+  const [isPaused, setIsPaused] = React.useState(false);
   const playerRef = React.useRef<YT.Player | null>(null);
   const playerContainerRef = React.useRef<HTMLDivElement>(null);
+  const endCheckIntervalRef = React.useRef<NodeJS.Timeout | null>(null);
 
   // Load YouTube IFrame API
   React.useEffect(() => {
@@ -255,10 +263,31 @@ export default function App() {
       playerRef.current = null;
     }
 
+    // Reset pause state when changing videos
+    setIsPaused(false);
+
     // Create new player
     playerRef.current = new window.YT.Player("yt-player", {
       videoId: selected,
+      playerVars: {
+        rel: 0, // Only show related videos from same channel
+        modestbranding: 1, // Minimize YouTube branding
+      },
       events: {
+        onReady: () => {
+          // Start interval to check if video is near end
+          endCheckIntervalRef.current = setInterval(() => {
+            if (!playerRef.current) return;
+
+            const currentTime = playerRef.current.getCurrentTime();
+            const duration = playerRef.current.getDuration();
+
+            // Pause at the very last moment (0.5s before end) to prevent end screen
+            if (duration > 0 && currentTime >= duration - 0.5) {
+              playerRef.current.pauseVideo();
+            }
+          }, 500); // Check every 500ms
+        },
         onStateChange: (event) => {
           const state = event.data;
           if (state === window.YT.PlayerState.PLAYING) {
@@ -275,12 +304,14 @@ export default function App() {
             }
             // Start tracking time when video plays
             watchTime.startTracking();
+            setIsPaused(false);
           } else if (
             state === window.YT.PlayerState.PAUSED ||
             state === window.YT.PlayerState.ENDED
           ) {
             // Stop tracking time when video pauses or ends
             watchTime.stopTracking();
+            setIsPaused(true);
           }
         },
       },
@@ -290,6 +321,10 @@ export default function App() {
       if (playerRef.current) {
         playerRef.current.destroy();
         playerRef.current = null;
+      }
+      if (endCheckIntervalRef.current) {
+        clearInterval(endCheckIntervalRef.current);
+        endCheckIntervalRef.current = null;
       }
     };
     // Only recreate player when video ID or API readiness changes
@@ -442,9 +477,16 @@ export default function App() {
           <div className="mb-6">
             <div
               ref={playerContainerRef}
-              className="aspect-video w-full overflow-hidden rounded-md border border-gray-300"
+              className="relative aspect-video w-full overflow-hidden rounded-md border border-gray-300"
             >
               <div id="yt-player" className="h-full w-full" />
+              {/* Black overlay to hide "More videos" bar when paused */}
+              {isPaused && (
+                <div
+                  className="absolute left-0 right-0 bg-black pointer-events-none"
+                  style={{ bottom: '48px', height: 'calc(35% - 48px)' }}
+                />
+              )}
             </div>
             <div className="mt-2 flex justify-end">
               <button
