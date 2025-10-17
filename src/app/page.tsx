@@ -537,14 +537,19 @@ export default function App() {
                     selected === v.id ? "border-gray-800" : "border-gray-200"
                   } ${!watchTime.canPlay && selected !== v.id ? "opacity-60" : ""}`}
                 >
-                  <div className="aspect-video w-full overflow-hidden bg-gray-100">
+                  <div className="relative aspect-video w-full overflow-hidden bg-gray-100">
                     {/* Use img to avoid Next image config */}
                     {v.thumbnail ? (
-                      <img
-                        src={v.thumbnail}
-                        alt={v.title}
-                        className="h-full w-full object-cover transition-transform group-hover:scale-[1.02]"
-                      />
+                      <>
+                        <img
+                          src={v.thumbnail}
+                          alt={v.title}
+                          className={`h-full w-full object-cover transition-transform group-hover:scale-[1.02] ${selected !== v.id ? "grayscale" : ""}`}
+                        />
+                        <div className="pointer-events-none absolute inset-0 flex items-end bg-gradient-to-t from-black/80 via-black/40 to-transparent px-3 pb-3 text-sm font-semibold text-white opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                          <span className="line-clamp-2">{v.title}</span>
+                        </div>
+                      </>
                     ) : (
                       <div className="flex h-full items-center justify-center text-sm text-gray-400">
                         No thumbnail
